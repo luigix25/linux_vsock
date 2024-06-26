@@ -16,7 +16,6 @@
 #include <linux/workqueue.h>
 #include <linux/file.h>
 #include <linux/slab.h>
-#include <linux/sched/clock.h>
 #include <linux/sched/signal.h>
 #include <linux/vmalloc.h>
 
@@ -406,17 +405,6 @@ static void vhost_zerocopy_callback(struct sk_buff *skb,
 		vhost_poll_queue(&vq->poll);
 
 	rcu_read_unlock_bh();
-}
-
-static inline unsigned long busy_clock(void)
-{
-	return local_clock() >> 10;
-}
-
-static bool vhost_can_busy_poll(unsigned long endtime)
-{
-	return likely(!need_resched() && !time_after(busy_clock(), endtime) &&
-		      !signal_pending(current));
 }
 
 static void vhost_net_disable_vq(struct vhost_net *n,

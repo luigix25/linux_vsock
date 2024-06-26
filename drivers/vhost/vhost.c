@@ -185,6 +185,13 @@ void vhost_work_init(struct vhost_work *work, vhost_work_fn_t fn)
 }
 EXPORT_SYMBOL_GPL(vhost_work_init);
 
+bool vhost_can_busy_poll(unsigned long endtime)
+{
+	return likely(!need_resched() && !time_after(busy_clock(), endtime) &&
+		      !signal_pending(current));
+}
+EXPORT_SYMBOL_GPL(vhost_can_busy_poll);
+
 /* Init poll structure */
 void vhost_poll_init(struct vhost_poll *poll, vhost_work_fn_t fn,
 		     __poll_t mask, struct vhost_dev *dev,
