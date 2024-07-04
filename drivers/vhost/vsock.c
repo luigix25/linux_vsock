@@ -86,12 +86,80 @@ static struct vhost_vsock *vhost_vsock_get(u32 guest_cid)
 	return NULL;
 }
 
+static void vhost_vsock_busy_poll(struct vhost_vsock *vsock,
+				struct vhost_virtqueue *rvq,
+				struct vhost_virtqueue *tvq,
+				bool *busyloop_intr,
+				bool poll_rx)
+{
+	unsigned long busyloop_timeout;
+	unsigned long endtime;
+	struct vhost_virtqueue *other_vq = poll_rx ? tvq : rvq;
+
+	/* Try to hold the vq mutex of the paired virtqueue. We can't
+	 * use mutex_lock() here since we could not guarantee a
+	 * consistenet lock ordering.
+	 */
+	if (!mutex_trylock(&other_vq->mutex))
+		return;
+
+	vhost_disable_notify(&vsock->dev, other_vq);
+
+	busyloop_timeout = poll_rx ? rvq->busyloop_timeout:
+				     tvq->busyloop_timeout;
+
+	preempt_disable();
+	endtime = busy_clock() + busyloop_timeout;
+
+	while (vhost_can_busy_poll(endtime)) {
+		/* Controllo se l'altro worker vuole andare in esecuzione */
+		if (vhost_vq_has_work(other_vq)) {
+			*busyloop_intr = true;
+			break;
+		}
+
+		if ((!skb_queue_empty_lockless(&vsock->send_pkt_queue) &&
+		     !vhost_vq_avail_empty(&vsock->dev, rvq)) ||
+		    !vhost_vq_avail_empty(&vsock->dev, tvq))
+			break;
+
+		cpu_relax();
+	}
+
+	preempt_enable();
+
+	if (poll_rx || !skb_queue_empty_lockless(&vsock->send_pkt_queue)) {
+		/* Polling on RX (H2G).
+		 * Handling of the TX vq (G2H):
+		 * If there is any packet on the TX vq, schedule
+		 * the worker.
+		 */
+		if (!vhost_vq_avail_empty(&vsock->dev, other_vq)) {
+			vhost_poll_queue(&other_vq->poll);
+		} else if (unlikely(vhost_enable_notify(&vsock->dev, other_vq))) {
+			vhost_disable_notify(&vsock->dev, other_vq);
+			vhost_poll_queue(&other_vq->poll);
+		}
+	} else if (!poll_rx) { //serve realmente attivare le notifiche? non ho dati da inviare
+		/* On tx here (G2H).
+		 * Handling the RX vq (H2G)
+		 * Caller will check if something happened
+		 * after polling.
+		 */
+
+		vhost_enable_notify(&vsock->dev, other_vq);
+	}
+
+	mutex_unlock(&other_vq->mutex);
+}
+
 static void
 vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 			    struct vhost_virtqueue *vq)
 {
 	struct vhost_virtqueue *tx_vq = &vsock->vqs[VSOCK_VQ_TX];
 	int pkts = 0, total_len = 0;
+	bool busyloop_intr = false;
 	bool added = false;
 	bool restart_tx = false;
 
@@ -118,11 +186,19 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 		int head;
 
 		skb = virtio_vsock_skb_dequeue(&vsock->send_pkt_queue);
-
-		if (!skb) {
-			vhost_enable_notify(&vsock->dev, vq);
-			break;
+		if (!skb && vq->busyloop_timeout) {
+			vhost_vsock_busy_poll(vsock, vq, tx_vq, &busyloop_intr, true);
+			skb = virtio_vsock_skb_dequeue(&vsock->send_pkt_queue);
 		}
+
+		// Finisco il busy poll e non ho trovato nulla.
+		// Tuttavia posso essere stato interrotto dall'altro worker che
+		// voleva andare in esecuzione (busyloop_intr).
+		// Se mi rischedulo NON devo abilitare le notifiche verrebbero comunque (ri)disattivate,
+		// altrimenti sì? Nel codice originale lo fa, ma non sono troppo convinto (vedi foglio appunti)
+		// [caso 1]
+		if (!skb)
+			break;
 
 		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
 					 &out, &in, NULL, NULL);
@@ -136,13 +212,27 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 			/* We cannot finish yet if more buffers snuck in while
 			 * re-enabling notify.
 			 */
-			if (unlikely(vhost_enable_notify(&vsock->dev, vq))) {
+
+			// Se sono stato interrotto dall'altro worker che voleva andare in esecuzione
+			// ma non ho nulla da fare. Dato che non c'e' spazio in vq mi rischedulo e termino.
+			// (Secondo me) NON devo attivare le notifiche. [caso 2]
+
+			// Altrimenti controllo che nel frattempo non si sia liberato spazio in vq.
+			// Nel caso riprovo a mandare.
+
+			if (unlikely(busyloop_intr)) {
+				vhost_poll_queue(&vq->poll);
+			} else if (unlikely(vhost_enable_notify(&vsock->dev, vq))) {
 				vhost_disable_notify(&vsock->dev, vq);
 				continue;
 			}
-			break;
+			goto out_due;
 		}
 
+		// non ho finito di fare polling ma ho comunque da fare, quindi va bene
+		busyloop_intr = false;
+
+		// [caso 3] (tutti i casi di errore con break da ora in poi). Secondo me bisognerebbe andare ad out_due
 		if (out) {
 			kfree_skb(skb);
 			vq_err(vq, "Expected 0 output buffers, got %u\n", out);
@@ -247,6 +337,15 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 			consume_skb(skb);
 		}
 	} while(likely(!vhost_exceeds_weight(vq, ++pkts, total_len)));
+
+	// [caso 1]
+	if (unlikely(busyloop_intr))
+		vhost_poll_queue(&vq->poll);
+	else // [caso 3]
+		vhost_enable_notify(&vsock->dev, vq);
+
+	// [caso 2]
+out_due:
 	if (added)
 		vhost_signal(&vsock->dev, vq);
 
@@ -473,6 +572,30 @@ static bool vhost_transport_seqpacket_allow(u32 remote_cid)
 	return seqpacket_allow;
 }
 
+static int vhost_vsock_tx_get_vq_desc(struct vhost_vsock *vsock,
+		      struct iovec iov[], unsigned int iov_size,
+		      unsigned int *out_num, unsigned int *in_num,
+		      bool *busyloop_intr)
+{
+
+	struct vhost_virtqueue *rvq = &vsock->vqs[VSOCK_VQ_RX];
+	struct vhost_virtqueue *tvq = &vsock->vqs[VSOCK_VQ_TX];
+
+	int r = vhost_get_vq_desc(tvq, tvq->iov, ARRAY_SIZE(tvq->iov),
+				  out_num, in_num, NULL, NULL);
+
+	if (r == tvq->num && tvq->busyloop_timeout) {
+
+		vhost_vsock_busy_poll(vsock, rvq, tvq, busyloop_intr, false);
+
+		r = vhost_get_vq_desc(tvq, tvq->iov, ARRAY_SIZE(tvq->iov),
+				      out_num, in_num, NULL, NULL);
+	}
+
+	return r;
+
+}
+
 static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 {
 	struct vhost_virtqueue *vq = container_of(work, struct vhost_virtqueue,
@@ -484,7 +607,7 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 	struct sk_buff *skb;
 	bool added = false;
 
-	mutex_lock(&vq->mutex);
+	mutex_lock_nested(&vq->mutex,0);
 
 	if (!vhost_vq_get_backend(vq))
 		goto out;
@@ -495,6 +618,7 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 	vhost_disable_notify(&vsock->dev, vq);
 	do {
 		struct virtio_vsock_hdr *hdr;
+		bool busyloop_intr = false;
 
 		if (!vhost_vsock_more_replies(vsock)) {
 			/* Stop tx until the device processes already
@@ -504,13 +628,17 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 			goto no_more_replies;
 		}
 
-		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
-					 &out, &in, NULL, NULL);
-		if (head < 0)
+		head = vhost_vsock_tx_get_vq_desc(vsock, vq->iov, ARRAY_SIZE(vq->iov),
+					 &out, &in, &busyloop_intr);
+
+		//TODO: le notifiche non vengono riattivate!
+		if (unlikely(head < 0))
 			break;
 
 		if (head == vq->num) {
-			if (unlikely(vhost_enable_notify(&vsock->dev, vq))) {
+			if (unlikely(busyloop_intr)) {
+				vhost_poll_queue(&vq->poll);
+			} else if (unlikely(vhost_enable_notify(&vsock->dev, vq))) {
 				vhost_disable_notify(&vsock->dev, vq);
 				continue;
 			}
@@ -678,6 +806,10 @@ static int vhost_vsock_dev_open(struct inode *inode, struct file *file)
 	vhost_dev_init(&vsock->dev, vqs, ARRAY_SIZE(vsock->vqs),
 		       UIO_MAXIOV, VHOST_VSOCK_PKT_WEIGHT,
 		       VHOST_VSOCK_WEIGHT, true, NULL);
+
+	/* TODO: rimuovere!!!! */
+	vqs[VSOCK_VQ_TX]->busyloop_timeout = 700;
+	vqs[VSOCK_VQ_RX]->busyloop_timeout = 700;
 
 	file->private_data = vsock;
 	skb_queue_head_init(&vsock->send_pkt_queue);
